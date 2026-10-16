@@ -986,6 +986,19 @@ pub struct FlatText {
     pub file_glyphs: Vec<Range<usize>>,
 }
 
+/// Recover the authored link label after truncation or file-glyph insertion.
+/// A stale or inconsistent presentation offset map must never panic the UI.
+fn link_label_text<'a>(flat: &'a FlatText, range: &Range<usize>) -> &'a str {
+    if let Some(original) = &flat.original {
+        let start = original.offsets.original(range.start);
+        let end = original.offsets.original(range.end);
+        if let Some(label) = original.text.get(start..end) {
+            return label;
+        }
+    }
+    flat.text.get(range.clone()).unwrap_or_default()
+}
+
 /// Inline-code tint: a text-safe use of the selected accent identity.
 pub fn inline_code_text(theme: &Theme) -> Hsla {
     theme.code_text
@@ -1313,15 +1326,7 @@ pub(super) fn flat_text_presented_element(
             .map(|(range, url)| {
                 (
                     range.start..glyph_end(range),
-                    LinkTarget::new(
-                        flat.original
-                            .as_ref()
-                            .map_or(&flat.text[range.clone()], |original| {
-                                &original.text[original.offsets.original(range.start)
-                                    ..original.offsets.original(range.end)]
-                            }),
-                        url,
-                    ),
+                    LinkTarget::new(link_label_text(&flat, range), url),
                 )
             })
             .collect(),
@@ -3647,6 +3652,60 @@ mod tests {
             token_color(HighlightKind::Keyword, &theme)
         );
         assert_ne!(token_color(HighlightKind::Comment, &theme), theme.text);
+    }
+
+    #[test]
+    fn link_labels_fall_back_on_inverted_or_invalid_original_ranges() {
+        use crate::markdown::link_presentation::{OffsetMap, OriginalText};
+
+        let mut flat = FlatText {
+            text: "visible".into(),
+            original: Some(OriginalText {
+                text: "source".into(),
+                // Simulates the inverted original offsets from #892: the
+                // displayed range 1..3 maps to 4..2.
+                offsets: OffsetMap {
+                    omissions: vec![(4..4, 0..2), (2..2, 2..4)],
+                    prior: None,
+                },
+            }),
+            runs: Vec::new(),
+            links: Vec::new(),
+            code_ranges: Vec::new(),
+            file_glyphs: Vec::new(),
+        };
+        assert_eq!(link_label_text(&flat, &(1..3)), "is");
+        assert_eq!(link_label_text(&flat, &(100..200)), "");
+
+        // A bad UTF-8 boundary must take the same non-panicking fallback.
+        flat.original = Some(OriginalText {
+            text: "🙂 source".into(),
+            offsets: OffsetMap::default(),
+        });
+        assert_eq!(link_label_text(&flat, &(1..3)), "is");
+        flat.original = None;
+        assert_eq!(link_label_text(&flat, &(1..3)), "is");
+    }
+
+    #[test]
+    fn link_labels_keep_full_source_when_truncated() {
+        let source = "https://example.com/very-long-path";
+        let flat = flatten_runs(
+            &[InlineRun {
+                text: source.into(),
+                style: InlineStyle {
+                    link: Some(source.into()),
+                    ..Default::default()
+                },
+            }],
+            &Theme::dark(),
+            false,
+        );
+        let shown = crate::markdown::link_presentation::truncate(&flat, 12.0, |text, _| {
+            text.chars().count() as f32
+        });
+        assert_ne!(shown.text.as_ref(), source);
+        assert_eq!(link_label_text(&shown, &shown.links[0].0), source);
     }
 
     #[test]
