@@ -24,6 +24,8 @@ pub(crate) struct ChatPersistence {
     #[cfg(test)]
     writes: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
+    attempts: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
     before_export: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
@@ -53,6 +55,8 @@ impl ChatPersistence {
             initial_cursor_verified: verified,
             #[cfg(test)]
             writes: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            attempts: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             before_export: Mutex::new(None),
         });
@@ -124,7 +128,18 @@ impl ChatPersistence {
             })
             .await
             {
-                tracing::error!(%error, "chat snapshot worker failed");
+                // A panicked export may have poisoned Loro's document mutex.
+                // Retrying it every second cannot repair that document and
+                // floods the log; stop this worker without marking it saved.
+                if error.is_panic() {
+                    tracing::error!(
+                        chat = %this.chat_id,
+                        %error,
+                        "chat snapshot worker panicked; automatic retries stopped until restart"
+                    );
+                    return;
+                }
+                tracing::error!(chat = %this.chat_id, %error, "chat snapshot worker failed");
             }
             if this.doc.strong_count() == 0 {
                 return;
@@ -152,6 +167,8 @@ impl ChatPersistence {
             // Never read the cursor AFTER exporting: a concurrent import
             // could then label an older snapshot with a newer cursor.
             let cursor = self.cursor.load(Ordering::Acquire);
+            #[cfg(test)]
+            self.attempts.fetch_add(1, Ordering::Relaxed);
             #[cfg(test)]
             if let Some(hook) = self.before_export.lock().unwrap().take() {
                 hook();
@@ -276,6 +293,36 @@ mod tests {
         let doc = Arc::new(SessionDoc::init("whale").unwrap());
         let persistence = ChatPersistence::new(&doc, store.clone(), "whale".into(), 0);
         (dir, doc, store, persistence)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panicked_snapshot_stops_retries_without_acknowledging_dirty_data() {
+        let (_dir, _doc, store, persistence) = fixture();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        *persistence.before_export.lock().unwrap() = Some(Box::new(move || {
+            let _ = started_tx.send(());
+            panic!("injected snapshot export panic");
+        }));
+        persistence.applied(1, true);
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("first export should run")
+            .expect("panic hook should signal its start");
+
+        // Even a later update must not re-enter the poisoned document's
+        // snapshot path. Before this fix the worker requeued once a second.
+        persistence.applied(2, true);
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(
+            persistence.attempts.load(Ordering::Relaxed),
+            1,
+            "a panicked export must not be retried indefinitely"
+        );
+        assert!(!persistence.is_clean(), "the failed export is not saved");
+        assert!(
+            store.load_snapshot_with_cursor("whale").unwrap().is_none(),
+            "no unverified snapshot or cursor is published"
+        );
     }
 
     #[tokio::test]
