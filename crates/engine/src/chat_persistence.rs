@@ -70,6 +70,10 @@ pub(crate) struct ChatPersistence {
     /// Bytes handed to the store, whole saves and deltas.
     #[cfg(test)]
     bytes_written: std::sync::atomic::AtomicUsize,
+    /// Saves that got as far as reading the cursor, including ones that
+    /// then failed or panicked.
+    #[cfg(test)]
+    exports: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     before_export: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs between a save's export and its store write.
@@ -133,6 +137,8 @@ impl ChatPersistence {
             delta_writes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             bytes_written: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            exports: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             before_export: Mutex::new(None),
             #[cfg(test)]
@@ -245,6 +251,10 @@ impl ChatPersistence {
                         })
                         .await
                         {
+                            if error.is_panic() {
+                                this.stop_after_panic(&error);
+                                return;
+                            }
                             tracing::error!(%error, "chat snapshot compaction failed");
                         }
                         continue;
@@ -277,6 +287,10 @@ impl ChatPersistence {
             })
             .await
             {
+                if error.is_panic() {
+                    this.stop_after_panic(&error);
+                    return;
+                }
                 tracing::error!(%error, "chat snapshot worker failed");
             }
             if this.doc.strong_count() == 0 {
@@ -290,6 +304,18 @@ impl ChatPersistence {
                 }
             }
         }
+    }
+
+    /// A save that panicked inside Loro leaves the doc's lock poisoned
+    /// (#905), so every later export panics the same way: retrying once a
+    /// second can't repair it and only floods the log. The worker stops;
+    /// the change stays unsaved rather than being marked saved.
+    fn stop_after_panic(&self, error: &tokio::task::JoinError) {
+        tracing::error!(
+            chat = %self.chat_id,
+            %error,
+            "chat snapshot save panicked; this chat stops saving until the engine restarts"
+        );
     }
 
     /// Save what changed since the last save: a delta on top of this
@@ -337,6 +363,8 @@ impl ChatPersistence {
             // Never read the cursor AFTER exporting: a concurrent import
             // could then label an older snapshot with a newer cursor.
             let cursor = self.cursor.load(Ordering::Acquire);
+            #[cfg(test)]
+            self.exports.fetch_add(1, Ordering::Relaxed);
             #[cfg(test)]
             if let Some(hook) = self.before_export.lock().unwrap().take() {
                 hook();
@@ -609,6 +637,37 @@ mod tests {
         let doc = Arc::new(SessionDoc::init("whale").unwrap());
         let persistence = ChatPersistence::new(&doc, store.clone(), "whale".into(), 0);
         (dir, doc, store, persistence)
+    }
+
+    /// #905: a save that panics (Loro poisoned the doc's lock, so every
+    /// export after it panics too) stops the worker instead of retrying once
+    /// a second, and the change is never marked saved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_save_that_panicked_is_not_retried() {
+        let (_dir, _doc, store, persistence) = fixture();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        *persistence.before_export.lock().unwrap() = Some(Box::new(move || {
+            let _ = started_tx.send(());
+            panic!("injected snapshot export panic");
+        }));
+        persistence.applied(1, true);
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("the first save runs")
+            .expect("the panicking hook signals first");
+        // A later change must not reach the export again either.
+        persistence.applied(2, true);
+        tokio::time::sleep(SAVE_INTERVAL * 2 + Duration::from_millis(500)).await;
+        assert_eq!(
+            persistence.exports.load(Ordering::Relaxed),
+            1,
+            "a panicked save must not be retried"
+        );
+        assert!(!persistence.is_clean(), "the panicked save is not marked saved");
+        assert!(
+            store.load_snapshot_with_cursor("whale").unwrap().is_none(),
+            "nothing is written for the panicked save"
+        );
     }
 
     #[test]
